@@ -48,9 +48,24 @@ class OntologyEdge(BaseModel):
     characteristics: list[str] = Field(default_factory=list)  # ["symmetric", "transitive", "functional"]
 
 
+class InferenceRule(BaseModel):
+    id: str
+    rel1: str
+    rel2: str
+    inferred_rel: str
+
+
+class MutexRule(BaseModel):
+    id: str
+    rel1: str
+    rel2: str
+
+
 class GraphState(BaseModel):
     nodes: list[OntologyNode] = Field(default_factory=list)
     edges: list[OntologyEdge] = Field(default_factory=list)
+    inference_rules: list[InferenceRule] = Field(default_factory=list)
+    mutex_rules: list[MutexRule] = Field(default_factory=list)
 
 
 class CreateNodePayload(BaseModel):
@@ -694,14 +709,75 @@ def create_edge(payload: CreateEdgePayload) -> OntologyEdge:
     if payload.source not in all_ids or payload.target not in all_ids:
         raise HTTPException(status_code=400, detail="source 或 target 节点不存在")
 
+    relation_clean = payload.relation.strip()
+
+    # 1. 互斥规则检查
+    # 获取 source 和 target 之间已存在的所有关系（不分方向，只要两个节点之间存在即可）
+    existing_edges = [
+        e for e in graph_state.edges 
+        if (e.source == payload.source and e.target == payload.target) or 
+           (e.source == payload.target and e.target == payload.source)
+    ]
+    existing_rels = {e.relation for e in existing_edges}
+
+    for rule in graph_state.mutex_rules:
+        if relation_clean == rule.rel1 and rule.rel2 in existing_rels:
+            raise HTTPException(status_code=400, detail=f"互斥约束冲突：无法在已有 '{rule.rel2}' 关系上建立 '{rule.rel1}'")
+        if relation_clean == rule.rel2 and rule.rel1 in existing_rels:
+            raise HTTPException(status_code=400, detail=f"互斥约束冲突：无法在已有 '{rule.rel1}' 关系上建立 '{rule.rel2}'")
+
     edge = OntologyEdge(
         id=str(uuid.uuid4()),
         source=payload.source,
         target=payload.target,
-        relation=payload.relation.strip(),
+        relation=relation_clean,
         kind=payload.kind,
     )
     graph_state.edges.append(edge)
+    
+    # 2. 顺承/推理规则自动连线 (简单的 BFS 传播)
+    edges_to_process = [edge]
+    # 使用 signature 避免重复添加和无限循环
+    seen_signatures = {(e.source, e.target, e.relation) for e in graph_state.edges}
+
+    while edges_to_process:
+        curr = edges_to_process.pop(0)
+
+        for rule in graph_state.inference_rules:
+            # 模式 A: curr 作为 rel1 (A -> B)，寻找 B -> C 的 rel2
+            if curr.relation == rule.rel1:
+                for e in graph_state.edges:
+                    if e.source == curr.target and e.relation == rule.rel2:
+                        sig = (curr.source, e.target, rule.inferred_rel)
+                        if sig not in seen_signatures and curr.source != e.target:
+                            inferred_edge = OntologyEdge(
+                                id=str(uuid.uuid4()),
+                                source=curr.source,
+                                target=e.target,
+                                relation=rule.inferred_rel,
+                                kind="relation"
+                            )
+                            graph_state.edges.append(inferred_edge)
+                            edges_to_process.append(inferred_edge)
+                            seen_signatures.add(sig)
+
+            # 模式 B: curr 作为 rel2 (B -> C)，寻找 A -> B 的 rel1
+            if curr.relation == rule.rel2:
+                for e in graph_state.edges:
+                    if e.target == curr.source and e.relation == rule.rel1:
+                        sig = (e.source, curr.target, rule.inferred_rel)
+                        if sig not in seen_signatures and e.source != curr.target:
+                            inferred_edge = OntologyEdge(
+                                id=str(uuid.uuid4()),
+                                source=e.source,
+                                target=curr.target,
+                                relation=rule.inferred_rel,
+                                kind="relation"
+                            )
+                            graph_state.edges.append(inferred_edge)
+                            edges_to_process.append(inferred_edge)
+                            seen_signatures.add(sig)
+
     save_graph(graph_state)
     return edge
 

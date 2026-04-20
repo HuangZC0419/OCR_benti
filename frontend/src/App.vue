@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, nextTick } from "vue";
+import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 
 // Use relative path for same-origin or explicit API_BASE. Fallback to current hostname with 8000 port.
 const defaultApiBase = typeof window !== 'undefined' ? `http://${window.location.hostname}:8000` : "http://127.0.0.1:8000";
@@ -7,6 +7,8 @@ const API_BASE = import.meta.env.VITE_API_BASE || defaultApiBase;
 
 const nodes = ref([]);
 const edges = ref([]);
+const inferenceRules = ref([]);
+const mutexRules = ref([]);
 const selectedNodeId = ref(null);
 const selectedEdgeId = ref(null);
 const connectMode = ref(false);
@@ -215,6 +217,51 @@ const selectedOcrEntities = computed(() =>
   ocrCandidates.value.filter((item) => item.selected).map((item) => item.text)
 );
 
+// 规则管理
+const rulesDialogVisible = ref(false);
+const newMutex = ref({ rel1: '', rel2: '' });
+const newInference = ref({ rel1: '', rel2: '', inferred_rel: '' });
+const uniqueRelations = computed(() => Array.from(new Set(edges.value.map(e => e.relation))).filter(Boolean));
+
+function addMutexRule() {
+  if (!newMutex.value.rel1 || !newMutex.value.rel2) {
+    statusMessage.value = "请填写完整的互斥关系";
+    return;
+  }
+  mutexRules.value.push({
+    id: Date.now().toString(),
+    rel1: newMutex.value.rel1,
+    rel2: newMutex.value.rel2
+  });
+  newMutex.value = { rel1: '', rel2: '' };
+  syncGraph();
+}
+
+function removeMutexRule(id) {
+  mutexRules.value = mutexRules.value.filter(r => r.id !== id);
+  syncGraph();
+}
+
+function addInferenceRule() {
+  if (!newInference.value.rel1 || !newInference.value.rel2 || !newInference.value.inferred_rel) {
+    statusMessage.value = "请填写完整的推理关系";
+    return;
+  }
+  inferenceRules.value.push({
+    id: Date.now().toString(),
+    rel1: newInference.value.rel1,
+    rel2: newInference.value.rel2,
+    inferred_rel: newInference.value.inferred_rel
+  });
+  newInference.value = { rel1: '', rel2: '', inferred_rel: '' };
+  syncGraph();
+}
+
+function removeInferenceRule(id) {
+  inferenceRules.value = inferenceRules.value.filter(r => r.id !== id);
+  syncGraph();
+}
+
 // ========================
 // 核心逻辑 & 节点展示
 // ========================
@@ -419,9 +466,27 @@ async function loadGraph() {
     const graph = await request("/api/graph");
     nodes.value = graph.nodes || [];
     edges.value = graph.edges || [];
+    inferenceRules.value = graph.inference_rules || [];
+    mutexRules.value = graph.mutex_rules || [];
     statusMessage.value = "已加载后端数据";
   } catch (error) {
     statusMessage.value = `加载失败：${error.message}`;
+  }
+}
+
+async function syncGraph() {
+  try {
+    await request("/api/graph", {
+      method: "PUT",
+      body: JSON.stringify({
+        nodes: nodes.value,
+        edges: edges.value,
+        inference_rules: inferenceRules.value,
+        mutex_rules: mutexRules.value
+      })
+    });
+  } catch (error) {
+    statusMessage.value = `同步失败：${error.message}`;
   }
 }
 
@@ -513,13 +578,6 @@ async function reparentNode(nodeId, newParentId) {
   return request(`/api/nodes/${nodeId}/reparent`, {
     method: "POST",
     body: JSON.stringify({ new_parent_id: newParentId })
-  });
-}
-
-async function syncGraph() {
-  await request("/api/graph", {
-    method: "PUT",
-    body: JSON.stringify({ nodes: nodes.value, edges: edges.value })
   });
 }
 
@@ -687,11 +745,13 @@ async function onClickNode(nodeId) {
       relation,
       kind: "relation"
     });
-    statusMessage.value = "已创建本体关系";
+    await loadGraph(); // 重新加载以获取可能通过规则自动推导出的新边
+    statusMessage.value = "已创建本体关系。请继续选择下一个起始本体，或取消连线模式。";
   } catch (error) {
     statusMessage.value = `创建关系失败：${error.message}`;
   } finally {
-    cancelConnectMode();
+    // 保持连线模式开启，只清空起始节点，以便连续连线
+    connectSourceId.value = null;
   }
 }
 
@@ -706,7 +766,7 @@ function startDrag(event, node) {
 function startPanning(event) {
   if (event.button !== 0) return; // 仅左键平移
   // 弹窗或右键菜单打开时，不启动平移
-  if (promptState.value.visible || confirmState.value.visible || ocrDialogVisible.value || contextMenu.value.visible) return;
+  if (promptState.value.visible || confirmState.value.visible || ocrDialogVisible.value || contextMenu.value.visible || rulesDialogVisible.value) return;
   isPanning.value = true;
   panStart.value = {
     x: event.clientX - viewOffset.value.x,
@@ -769,15 +829,40 @@ function formatSymbol(text) {
   return text;
 }
 
+function handleGlobalKeyDown(e) {
+  if (e.key === "Escape") {
+    if (connectMode.value) {
+      cancelConnectMode();
+      statusMessage.value = "已取消连线模式";
+    }
+    if (reparentMode.value) {
+      cancelReparentMode();
+      statusMessage.value = "已取消子本体模式";
+    }
+  }
+}
+
 onMounted(() => {
   loadGraph();
   window.addEventListener("pointermove", onPointerMove);
   window.addEventListener("pointerup", onPointerUp);
+  window.addEventListener("keydown", handleGlobalKeyDown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("pointermove", onPointerMove);
+  window.removeEventListener("pointerup", onPointerUp);
+  window.removeEventListener("keydown", handleGlobalKeyDown);
 });
 </script>
 
 <template>
   <div class="app-container" @click="hideContextMenu">
+    <!-- 全局关系数据列表，供所有的 input list="rel-list" 使用 -->
+    <datalist id="rel-list">
+      <option v-for="r in uniqueRelations" :key="r" :value="r"></option>
+    </datalist>
+
     <aside class="sidebar" @click.stop>
       <div class="sidebar-header">
         <div class="logo">
@@ -817,6 +902,9 @@ onMounted(() => {
             @click="reparentMode ? cancelReparentMode() : enableReparentMode()"
           >
             <span class="icon">🌳</span> {{ reparentMode ? '取消子本体模式' : '转为子本体模式' }}
+          </button>
+          <button class="btn btn-secondary" @click="rulesDialogVisible = true">
+            <span class="icon">⚙️</span> 关系逻辑规则设置
           </button>
           <p class="tip-text" v-if="connectMode">请在画布点击目标本体</p>
           <p class="tip-text" v-if="reparentMode">先选待移动本体，再点目标父本体</p>
@@ -918,6 +1006,54 @@ onMounted(() => {
           <div class="prompt-actions">
             <button class="btn btn-secondary" @click="handleConfirm(false)">取消</button>
             <button class="btn btn-danger" @click="handleConfirm(true)">确定清空</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 关系规则管理弹窗 -->
+      <div class="prompt-overlay" v-if="rulesDialogVisible" @click.self="rulesDialogVisible = false">
+        <div class="prompt-dialog rules-dialog" @click.stop>
+          <div class="ocr-dialog-header">
+            <h3>关系逻辑规则设置</h3>
+            <button class="btn btn-ghost ocr-close-btn" @click="rulesDialogVisible = false">关闭</button>
+          </div>
+
+          <div class="rule-section">
+            <h4 class="rule-title">互斥约束</h4>
+            <p class="rule-desc">定义不能同时存在的两种关系（例如：定义了"恋人"就不能定义"父子"）</p>
+            <div class="rule-add-row">
+              <input type="text" list="rel-list" class="input-field" v-model="newMutex.rel1" placeholder="关系 A (如 恋人)" />
+              <span class="rule-operator">与</span>
+              <input type="text" list="rel-list" class="input-field" v-model="newMutex.rel2" placeholder="关系 B (如 父子)" />
+              <button class="btn btn-primary" @click="addMutexRule">添加互斥</button>
+            </div>
+            <ul class="rule-list">
+              <li class="rule-item" v-for="rule in mutexRules" :key="rule.id">
+                <span><span class="tag">{{ rule.rel1 }}</span> 互斥于 <span class="tag">{{ rule.rel2 }}</span></span>
+                <button class="btn btn-danger btn-sm" @click="removeMutexRule(rule.id)">删除</button>
+              </li>
+              <li class="rule-item empty" v-if="mutexRules.length === 0">暂无互斥规则</li>
+            </ul>
+          </div>
+
+          <div class="rule-section">
+            <h4 class="rule-title">顺承/推理规则</h4>
+            <p class="rule-desc">定义关系传递产生的新关系（例如："父子" + "父子" = "爷孙"）</p>
+            <div class="rule-add-row">
+              <input type="text" list="rel-list" class="input-field" v-model="newInference.rel1" placeholder="关系 1 (如 父子)" />
+              <span class="rule-operator">+</span>
+              <input type="text" list="rel-list" class="input-field" v-model="newInference.rel2" placeholder="关系 2 (如 父子)" />
+              <span class="rule-operator">=</span>
+              <input type="text" list="rel-list" class="input-field" v-model="newInference.inferred_rel" placeholder="推理结果 (如 爷孙)" />
+              <button class="btn btn-primary" @click="addInferenceRule">添加推理</button>
+            </div>
+            <ul class="rule-list">
+              <li class="rule-item" v-for="rule in inferenceRules" :key="rule.id">
+                <span><span class="tag">{{ rule.rel1 }}</span> + <span class="tag">{{ rule.rel2 }}</span> = <span class="tag highlight">{{ rule.inferred_rel }}</span></span>
+                <button class="btn btn-danger btn-sm" @click="removeInferenceRule(rule.id)">删除</button>
+              </li>
+              <li class="rule-item empty" v-if="inferenceRules.length === 0">暂无推理规则</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -1097,7 +1233,7 @@ onMounted(() => {
         <template v-else-if="selectedEdge">
           <div class="detail-group">
             <label>关系名称</label>
-            <input type="text" v-model="selectedEdge.relation" @change="syncGraph" class="input-field" />
+            <input type="text" list="rel-list" v-model="selectedEdge.relation" @change="syncGraph" class="input-field" />
           </div>
 
           <div class="detail-group" v-if="selectedEdge.kind === 'relation'">
@@ -1503,6 +1639,108 @@ onMounted(() => {
   padding: 24px;
   border-top: 1px solid #f1f5f9;
   background: #f8fafc;
+}
+
+/* 规则管理样式 */
+.rules-dialog {
+  width: min(96vw, 1100px);
+  max-width: 1100px;
+  max-height: 88vh;
+  overflow: auto;
+}
+
+.rule-section {
+  margin-top: 16px;
+  padding: 16px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+
+.rule-title {
+  margin: 0 0 4px 0;
+  font-size: 15px;
+  color: #1e293b;
+}
+
+.rule-desc {
+  margin: 0 0 12px 0;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.rule-add-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.rule-add-row .input-field {
+  flex: 1 1 220px;
+  min-width: 180px;
+  padding: 8px;
+  margin-bottom: 0;
+}
+
+.rule-operator {
+  font-weight: bold;
+  color: #64748b;
+  flex-shrink: 0;
+  line-height: 38px;
+}
+
+.rule-add-row .btn {
+  width: auto;
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+
+.rule-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rule-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: white;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+  font-size: 14px;
+}
+
+.rule-item.empty {
+  justify-content: center;
+  color: #94a3b8;
+  background: transparent;
+  border-style: dashed;
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 6px;
+  background: #e2e8f0;
+  color: #334155;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.tag.highlight {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .status-panel {
@@ -2017,7 +2255,7 @@ onMounted(() => {
   background: #ffffff;
   padding: 32px;
   border-radius: 16px;
-  width: 360px;
+  width: 800px;
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
   animation: modal-enter 0.2s ease-out;
 }
